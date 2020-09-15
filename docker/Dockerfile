@@ -40,29 +40,22 @@ ENV PATH "/home/direct/miniconda3/bin:/tmp/bart/:$PATH:$CUDA_ROOT"
 
 # Setup python packages
 RUN conda update -n base conda -yq
-RUN conda install python=3.7
+RUN conda install python=3.8
 RUN conda install numpy pyyaml mkl mkl-include setuptools cmake cffi typing boost
-RUN conda install pytorch=1.5 torchvision cudatoolkit=${CUDA} -c pytorch
-RUN conda install scipy pandas scikit-learn scikit-image=0.14 -yq
+RUN conda install pytorch=1.6 torchvision cudatoolkit=${CUDA} -c pytorch
+RUN conda install scipy pandas scikit-learn scikit-image=0.16 -yq
 RUN conda install cython tqdm jupyter sqlalchemy -yq
-RUN pip install opencv-python simpleitk h5py -q
-RUN pip install runstats -q
-RUN pip install tb-nightly -q
-RUN pip install --pre omegaconf -q
-
-# Install apex for mixed precision training
-WORKDIR /tmp
-RUN git clone https://github.com/NVIDIA/apex
-WORKDIR apex
-# A bug in the install creates a exit code 1, blocking docker from continuing, always provide exit code 0.
-RUN pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./; exit 0
+RUN python -m pip install opencv-python simpleitk h5py -q
+RUN python -m pip install runstats -q
+RUN python -m pip install tb-nightly -q
+RUN python -m pip install --pre omegaconf -q
+RUN python -m pip install pyxb
+RUN python -m pip install git+https://github.com/ismrmrd/ismrmrd-python.git
 
 USER root
 # Create directories for input and output
 RUN mkdir /data
 RUN mkdir /direct && chmod 777 /direct
-# Directory to copy or symlink data into. Needs to be 777 as DIRECT runs typically without root permissions.
-RUN mkdir /input && chmod 777 /input
 
 USER direct
 

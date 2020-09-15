@@ -6,130 +6,285 @@ import numpy as np
 import torch
 import os
 import sys
+import pathlib
 
-import direct.utils.logging
-import direct.launch
 
-from omegaconf import OmegaConf
-from pprint import pformat
-
-from direct.common.subsample import build_masking_functions
+from direct.common.subsample import build_masking_function
 from direct.data.mri_transforms import build_mri_transforms
-from direct.data.datasets import build_datasets
+from direct.data.datasets import build_dataset
 from direct.data.lr_scheduler import WarmupMultiStepLR
-from direct.utils import communication
-from direct.nn.rim.rim_engine import RIMEngine
-from direct.config.defaults import DefaultConfig, TrainingConfig
-from direct.nn.rim.mri_models import MRIReconstruction
+from direct.environment import setup_training_environment, Args
+from direct.launch import launch
 from direct.utils import str_to_class
+from direct.utils.io import read_list
 
-from projects.fastmri.args import Args
 
 logger = logging.getLogger(__name__)
 
 
-def setup(run_name, training_root, validation_root, base_directory,
-          cfg_filename, device, num_workers, resume, machine_rank):
-    experiment_dir = base_directory / run_name
+def get_filenames_for_datasets(cfg, files_root, data_root):
+    """
+    Given a list of filenames of data points, concatenate these into a large list of full filenames
 
-    if communication.get_local_rank() == 0:
-        # Want to prevent multiple workers from trying to write a directory
-        # This is required in the logging below
-        experiment_dir.mkdir(parents=True, exist_ok=True)
-    communication.synchronize()  # Ensure folders are in place.
+    Parameters
+    ----------
+    cfg : cfg-object
+        cfg object having property lists having the relative paths compared to files root.
+    files_root : pathlib.Path
+    data_root : pathlib.Path
 
-    # Load configs from YAML file to check which model needs to be loaded.
-    cfg_from_file = OmegaConf.load(cfg_filename)
-    model_name = cfg_from_file.model_name + 'Config'
-    try:
-        model_cfg = str_to_class(f'direct.nn.{cfg_from_file.model_name.lower()}.config', model_name)
-    except (AttributeError, ModuleNotFoundError) as e:
-        logger.error(f'Model configuration does not exist for {cfg_from_file.model_name} (err = {e}).')
-        sys.exit(-1)
+    Returns
+    -------
 
-    # Load the default configs to ensure type safety
-    base_cfg = OmegaConf.structured(DefaultConfig)
-    base_cfg = OmegaConf.merge(base_cfg, {'model': model_cfg, 'training': TrainingConfig()})
-    cfg = OmegaConf.merge(base_cfg, cfg_from_file)
+    """
+    if not cfg.lists:
+        return []
+    filter_filenames = []
+    for curr_list in cfg.lists:
+        filter_filenames += [
+            data_root / pathlib.Path(_)
+            for _ in read_list(pathlib.Path(files_root) / curr_list)
+        ]
 
-    # Setup logging
-    log_file = experiment_dir / f'log_{machine_rank}_{communication.get_local_rank()}.txt'
-    direct.utils.logging.setup(
-        use_stdout=communication.get_local_rank() == 0 or cfg.debug,
-        filename=log_file,
-        log_level=('INFO' if not cfg.debug else 'DEBUG')
+    return filter_filenames
+
+
+def build_dataset_from_environment(
+    env, datasets_config, lists_root, data_root, type_data, **kwargs
+):
+    datasets = []
+    for idx, dataset_config in enumerate(datasets_config):
+        transforms = build_mri_transforms(
+            forward_operator=env.forward_operator,
+            backward_operator=env.backward_operator,
+            mask_func=build_masking_function(**dataset_config.transforms.masking),
+            crop=dataset_config.transforms.crop,
+            crop_type=dataset_config.transforms.crop_type,
+            image_center_crop=dataset_config.transforms.image_center_crop,
+            estimate_sensitivity_maps=dataset_config.transforms.estimate_sensitivity_maps,
+            pad_coils=dataset_config.transforms.pad_coils,
+        )
+        logger.debug(f"Transforms for {type_data}: {idx}:\n{transforms}")
+
+        # Only give fancy names when validating
+        # TODO(jt): Perhaps this can be split up to just a description parameters, and parse config in the main func.
+        if type_data == "validation":
+            if dataset_config.text_description:
+                text_description = dataset_config.text_description
+            else:
+                text_description = f"ds{idx}" if len(datasets_config) > 1 else None
+        elif type_data == "training":
+            text_description = None
+        else:
+            raise ValueError(
+                f"Type of data needs to be either `validation` or `training`, got {type_data}."
+            )
+
+        dataset = build_dataset(
+            dataset_config.name,
+            data_root,
+            filenames_filter=get_filenames_for_datasets(
+                dataset_config, lists_root, data_root
+            ),
+            sensitivity_maps=None,
+            transforms=transforms,
+            text_description=text_description,
+            kspace_context=dataset_config.kspace_context,
+            **kwargs,
+        )
+        datasets.append(dataset)
+        logger.info(
+            f"Data size for {type_data} dataset"
+            f" {dataset_config.name} ({idx + 1}/{len(datasets_config)}): {len(dataset)}."
+        )
+
+    return datasets
+
+
+def setup_train(
+    run_name,
+    training_root,
+    validation_root,
+    base_directory,
+    cfg_filename,
+    checkpoint,
+    device,
+    num_workers,
+    resume,
+    machine_rank,
+    mixed_precision,
+    debug,
+):
+
+    env = setup_training_environment(
+        run_name,
+        base_directory,
+        cfg_filename,
+        device,
+        machine_rank,
+        mixed_precision,
+        debug=debug,
     )
-    logger.info(f'Machine rank: {machine_rank}.')
-    logger.info(f'Local rank: {communication.get_local_rank()}.')
-    logger.info(f'Logging: {log_file}.')
-    logger.info(f'Saving to: {experiment_dir}.')
-    logger.info(f'Run name: {run_name}.')
-    logger.info(f'Config file: {cfg_filename}.')
-    logger.info(f'Python version: {sys.version}.')
-    logger.info(f'PyTorch version: {torch.__version__}.')  # noqa
-    logger.info(f'CUDA {torch.version.cuda} - cuDNN {torch.backends.cudnn.version()}.')
-    logger.info(f'Configuration: {pformat(dict(cfg))}.')
-
-    # Create the model
-    logger.info('Building model.')
-    model = MRIReconstruction(2, **cfg.model).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f'Number of parameters: {n_params} ({n_params / 10.0**3:.2f}k).')
-    logger.debug(model)
 
     # Create training and validation data
-    train_mask_func, val_mask_func = build_masking_functions(**cfg.masking)
-    train_transforms, val_transforms = build_mri_transforms(
-        train_mask_func, val_mask_func=val_mask_func, crop=cfg.dataset.transforms.crop)
+    # Transforms configuration
+    training_datasets = build_dataset_from_environment(
+        env=env,
+        datasets_config=env.cfg.training.datasets,
+        lists_root=cfg_filename.parents[0],
+        data_root=training_root,
+        type_data="training",
+    )
+    training_data_sizes = [len(_) for _ in training_datasets]
+    logger.info(
+        f"Training data sizes: {training_data_sizes} (sum={sum(training_data_sizes)})."
+    )
 
-    training_data, validation_data = build_datasets(
-        cfg.dataset.name, training_root, train_sensitivity_maps=None, train_transforms=train_transforms,
-        validation_root=validation_root, val_sensitivity_maps=None, val_transforms=val_transforms)
+    if validation_root:
+        validation_data = build_dataset_from_environment(
+            env=env,
+            datasets_config=env.cfg.validation.datasets,
+            lists_root=cfg_filename.parents[0],
+            data_root=validation_root,
+            type_data="validation",
+        )
+    else:
+        logger.info(f"No validation data.")
+        validation_data = None
 
     # Create the optimizers
-    logger.info('Building optimizers.')
-    optimizer: torch.optim.Optimizer = str_to_class('torch.optim', cfg.training.optimizer)(  # noqa
-        model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
+    logger.info("Building optimizers.")
+    optimizer_params = [{"params": env.engine.model.parameters()}]
+    for curr_model_name in env.engine.models:
+        # TODO(jt): Can get learning rate from the config per additional model too.
+        curr_learning_rate = env.cfg.training.lr
+        logger.info(
+            f"Adding model parameters of {curr_model_name} with learning rate {curr_learning_rate}."
+        )
+        optimizer_params.append(
+            {
+                "params": env.engine.models[curr_model_name].parameters(),
+                "lr": curr_learning_rate,
+            }
+        )
+
+    optimizer: torch.optim.Optimizer = str_to_class(
+        "torch.optim", env.cfg.training.optimizer
+    )(  # noqa
+        optimizer_params,
+        lr=env.cfg.training.lr,
+        weight_decay=env.cfg.training.weight_decay,
     )  # noqa
 
     # Build the LR scheduler, we use a fixed LR schedule step size, no adaptive training schedule.
-    solver_steps = list(range(cfg.training.lr_step_size, cfg.training.num_iterations, cfg.training.lr_step_size))
+    solver_steps = list(
+        range(
+            env.cfg.training.lr_step_size,
+            env.cfg.training.num_iterations,
+            env.cfg.training.lr_step_size,
+        )
+    )
     lr_scheduler = WarmupMultiStepLR(
-        optimizer, solver_steps, cfg.training.lr_gamma, warmup_factor=1 / 3.,
-        warmup_iters=cfg.training.lr_warmup_iter, warmup_method='linear')
+        optimizer,
+        solver_steps,
+        env.cfg.training.lr_gamma,
+        warmup_factor=1 / 3.0,
+        warmup_iterations=env.cfg.training.lr_warmup_iter,
+        warmup_method="linear",
+    )
 
     # Just to make sure.
     torch.cuda.empty_cache()
 
-    # Setup training engine.
-    engine = RIMEngine(cfg, model, device=device)
+    env.engine.train(
+        optimizer,
+        lr_scheduler,
+        training_datasets,
+        env.experiment_dir,
+        validation_data=validation_data,
+        resume=resume,
+        initialization=checkpoint,
+        num_workers=num_workers,
+    )
 
-    engine.train(
-        optimizer, lr_scheduler, training_data, experiment_dir,
-        validation_data=validation_data, resume=resume, num_workers=num_workers)
 
+if __name__ == "__main__":
+    # This sets MKL threads to 1.
+    # DataLoader can otherwise bring a l ot of difficulties when computing CPU FFTs in the transforms.
+    torch.set_num_threads(1)
+    os.environ["OMP_NUM_THREADS"] = "1"
 
-if __name__ == '__main__':
-    args = Args().parse_args()
+    # Remove warnings from named tensors being experimental
+    os.environ["PYTHONWARNINGS"] = "ignore"
+
+    epilog = f"""
+        Examples:
+        Run on single machine:
+            $ {sys.argv[0]} training_set validation_set experiment_dir --num-gpus 8 --cfg cfg.yaml
+        Run on multiple machines:
+            (machine0)$ {sys.argv[0]} training_set validation_set experiment_dir --machine-rank 0 --num-machines 2 --dist-url <URL> [--other-flags]
+            (machine1)$ {sys.argv[0]} training_set validation_set experiment_dir --machine-rank 1 --num-machines 2 --dist-url <URL> [--other-flags]
+        """
+
+    parser = Args(epilog=epilog)
+    parser.add_argument(
+        "training_root", type=pathlib.Path, help="Path to the training data."
+    )
+    parser.add_argument(
+        "validation_root", type=pathlib.Path, help="Path to the validation data."
+    )
+    parser.add_argument(
+        "experiment_dir",
+        type=pathlib.Path,
+        help="Path to the experiment directory.",
+    )
+    parser.add_argument(
+        "--cfg",
+        dest="cfg_file",
+        help="Config file for training.",
+        required=True,
+        type=pathlib.Path,
+    )
+    parser.add_argument(
+        "--initialization-checkpoint",
+        type=pathlib.Path,  # noqa
+        help="If this value is set to a proper checkpoint when training starts, "
+        "the model will be initialized with the weights given. "
+        "No other keys in the checkpoint will be loaded. "
+        "When another checkpoint would be available and the --resume flag is used, "
+        "this flag is ignored.",
+    )
+    parser.add_argument(
+        "--resume", help="Resume training if possible.", action="store_true"
+    )
+
+    args = parser.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    name = args.name if args.name is not None else os.path.basename(args.cfg_file)[:-5]
+    run_name = (
+        args.name if args.name is not None else os.path.basename(args.cfg_file)[:-5]
+    )
 
-    # There is no need for the launch script within one node and at most one GPU.
-    if args.num_machines == 1 and args.num_gpus <= 1:
-        setup(name, args.training_root, args.validation_root, args.experiment_directory,
-              args.cfg_file, args.device, args.num_workers, args.resume, args.machine_rank)
-
-    else:
-        direct.launch.launch(
-            setup,
-            args.num_gpus,
-            num_machines=args.num_machines,
-            machine_rank=args.machine_rank,
-            dist_url=args.dist_url,
-            args=(name, args.training_root, args.validation_root, args.experiment_directory,
-                  args.cfg_file, args.device, args.num_workers, args.resume, args.machine_rank),
-        )
+    # TODO(jt): Duplicate params
+    launch(
+        setup_train,
+        args.num_machines,
+        args.num_gpus,
+        args.machine_rank,
+        args.dist_url,
+        run_name,
+        args.training_root,
+        args.validation_root,
+        args.experiment_dir,
+        args.cfg_file,
+        args.initialization_checkpoint,
+        args.device,
+        args.num_workers,
+        args.resume,
+        args.machine_rank,
+        args.mixed_precision,
+        args.debug,
+    )

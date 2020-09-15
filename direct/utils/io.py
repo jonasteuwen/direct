@@ -25,12 +25,12 @@ def read_json(fn: Union[Dict, str, pathlib.Path]) -> Dict:
     if isinstance(fn, dict):
         return fn
 
-    with open(fn, 'r') as f:
+    with open(fn, "r") as f:
         data = json.load(f)
     return data
 
 
-def write_json(fn: Union[str, pathlib.Path], data: Dict) -> None:
+def write_json(fn: Union[str, pathlib.Path], data: Dict, indent=2) -> None:
     """
     Write dict data to fn.
 
@@ -38,13 +38,14 @@ def write_json(fn: Union[str, pathlib.Path], data: Dict) -> None:
     ----------
     fn : Path or str
     data : dict
+    indent: int
 
     Returns
     -------
     None
     """
-    with open(fn, 'w') as f:
-        json.dump(data, f)
+    with open(fn, "w") as f:
+        json.dump(data, f, indent=indent)
 
 
 def read_list(fn: Union[List, str, pathlib.Path]) -> List:
@@ -63,7 +64,7 @@ def read_list(fn: Union[List, str, pathlib.Path]) -> List:
     if isinstance(fn, (pathlib.Path, str)):
         with open(fn) as f:
             filter_fns = f.readlines()
-        return [_.strip() for _ in filter_fns if not _.startswith('#')]
+        return [_.strip() for _ in filter_fns if not _.startswith("#")]
     return fn
 
 
@@ -80,6 +81,6 @@ def write_list(fn: Union[str, pathlib.Path], data) -> None:
     -------
     None
     """
-    with open(fn, 'w') as f:
+    with open(fn, "w") as f:
         for line in data:
-            f.write(f'{line}\n')
+            f.write(f"{line}\n")

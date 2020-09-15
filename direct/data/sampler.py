@@ -7,11 +7,16 @@
 
 import torch
 import itertools
+import random
+import numpy as np
+import logging
 
 from typing import Optional
 from torch.utils.data.sampler import Sampler
 
 from direct.utils import communication
+
+from typing import List
 
 
 # https://stackoverflow.com/a/54802737
@@ -20,7 +25,7 @@ def chunks(list_to_chunk, number_of_chunks):
     d, r = divmod(len(list_to_chunk), number_of_chunks)
     for i in range(number_of_chunks):
         si = (d + 1) * (i if i < r else r) + d * (0 if i < r else i - r)
-        yield list_to_chunk[si:si + (d + 1 if i < r else d)]
+        yield list_to_chunk[si : si + (d + 1 if i < r else d)]
 
 
 class DistributedSampler(Sampler):
@@ -34,19 +39,24 @@ class DistributedSampler(Sampler):
     or `range(size) + range(size) + ...` (if shuffle is False)
     """
 
-    def __init__(self, size: int, shuffle: bool = True, seed: Optional[int] = None):
+    def __init__(
+        self,
+        size: int,
+        shuffle: bool = True,
+        seed: Optional[int] = None,
+    ):
         """
         Parameters
         ----------
         size : int
-            Length of the underlying dataset.
+            Size of underlying dataset.
         shuffle : bool
             If true, the indices will be shuffled.
         seed : int
             Initial seed of the shuffle, must be the same across all workers!
         """
         self._size = size
-        assert size > 0
+        assert self._size > 0
         self._shuffle = shuffle
         if seed is None:
             seed = communication.shared_random_seed()
@@ -57,7 +67,9 @@ class DistributedSampler(Sampler):
 
     def __iter__(self):
         start = self._rank
-        yield from itertools.islice(self._infinite_indices(), start, None, self._world_size)
+        yield from itertools.islice(
+            self._infinite_indices(), start, None, self._world_size
+        )
 
     def _infinite_indices(self):
         g = torch.Generator()
@@ -79,7 +91,14 @@ class DistributedSequentialSampler(Sampler):
     =====
     Dataset is assumed to be of constant size.
     """
-    def __init__(self, dataset, num_replicas=None, rank=None, limit_number_of_volumes=None):
+
+    def __init__(
+        self,
+        dataset,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        limit_number_of_volumes: bool = None,
+    ):
         if num_replicas is None:
             num_replicas = communication.get_world_size()
         if rank is None:
@@ -95,6 +114,9 @@ class DistributedSequentialSampler(Sampler):
         chunked_filenames = list(chunks(filenames, self.num_replicas))
         filenames = chunked_filenames[self.rank]
 
+        # Create volume indices for this sampler.
+        self.volume_indices = {k: self.dataset.volume_indices[k] for k in filenames}
+
         # Collect the indices belonging to these filenames.
         self.indices = []
         if self.rank < len(chunked_filenames):  # Otherwise there is nothing to fill.
@@ -106,3 +128,131 @@ class DistributedSequentialSampler(Sampler):
 
     def __len__(self):
         return len(self.indices)
+
+
+class BatchVolumeSampler(Sampler):
+    """Wraps another sampler to yield a mini-batch of indices which all belong to the same volume. This can mean
+    that some batches have less samples then the requested batch size.
+
+    Based on Pytorch 1.5.1 BatchSampler:
+    https://pytorch.org/docs/1.5.1/_modules/torch/utils/data/sampler.html#BatchSampler
+    """
+
+    def __init__(self, sampler: Sampler, batch_size: int):
+        if not isinstance(sampler, Sampler):
+            raise ValueError(
+                f"sampler should be an instance of "
+                f"torch.utils.data.Sampler, but got sampler={sampler}"
+            )
+
+        self.sampler = sampler
+        self.batch_size = batch_size
+
+        # Create a reverse lookup when we need to switch to a new batch
+        end_of_volume = []
+        self.__num_batches = 0
+        for filename in self.sampler.volume_indices:
+            curr_slice = self.sampler.volume_indices[filename]
+            end_of_volume.append(curr_slice.stop)
+            num_indices = curr_slice.stop - curr_slice.start + 1
+            self.__num_batches += num_indices // batch_size + num_indices % batch_size
+
+        self.end_of_volume = iter(end_of_volume[1:])
+        self._next_value = end_of_volume[0]
+
+    def __iter__(self):
+        batch = []
+        for idx in self.sampler:
+            batch.append(idx)
+            if (len(batch) == self.batch_size) or (idx == self._next_value - 1):
+                yield batch
+                batch = []
+
+            if idx == self._next_value - 1:
+                try:
+                    self._next_value = next(self.end_of_volume)
+                except StopIteration:
+                    pass
+
+        if len(batch) > 0:
+            yield batch
+
+    def __len__(self):
+        return self.__num_batches
+
+
+class ConcatDatasetBatchSampler(Sampler):
+    """
+    This sampler takes a ConcatDataset and samples complete batches of one of the underlying datasets randomly based
+    on the total size of the dataset.
+
+    Based on Pytorch 1.5.1 BatchSampler:
+    https://pytorch.org/docs/1.5.1/_modules/torch/utils/data/sampler.html#BatchSampler
+    """
+
+    def __init__(self, datasets: List, batch_size: int, seed: Optional[int] = None):
+        self.logger = logging.getLogger(type(self).__name__)
+
+        if (
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or batch_size <= 0
+        ):
+            raise ValueError(
+                f"batch_size should be a positive integer value, "
+                f"but got batch_size={batch_size}"
+            )
+
+        self.datasets = datasets
+        self.seed = seed
+        self.samplers = [
+            DistributedSampler(len(_), shuffle=True, seed=seed) for _ in datasets
+        ]
+
+        self.batch_size = batch_size
+        self.weights = np.asarray([len(_) for _ in datasets])
+        self.cumulative_sizes = self.cumsum(datasets)
+
+        self.logger.info(
+            f"Sampling batches with weights {self.weights} with cumulative sizes {self.cumulative_sizes}."
+        )
+        self._batch_samplers = [
+            self.batch_sampler(
+                sampler, 0 if idx == 0 else self.cumulative_sizes[idx - 1]
+            )
+            for idx, sampler in enumerate(self.samplers)
+        ]
+
+    def batch_sampler(self, sampler, sampler_offset):
+        batch = []
+        for batch_idx in sampler:
+            batch.append(batch_idx + sampler_offset)
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+
+        if len(batch) > 0:
+            yield batch
+
+    def __next__(self):
+        iterator_idx = random.choices(
+            range(len(self.weights)), weights=self.weights / self.weights.sum()
+        )[0]
+        return next(self._batch_samplers[iterator_idx])
+
+    def __iter__(self):
+        return self
+
+    @staticmethod
+    def cumsum(sequence):
+        # From Pytorch 1.5.1: torch.utils.data.dataset.ConcatDataset
+        r, s = [], 0
+        for e in sequence:
+            curr_len = len(e)
+            r.append(curr_len + s)
+            s += curr_len
+        return r
+
+    def __len__(self):
+        # This does not make sense for this sampler.
+        raise ValueError("length does not make sense for ConcatDatasetBatchSampler.")
